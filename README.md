@@ -6,7 +6,8 @@ A premium, AI-powered SaaS dashboard that predicts student placement probability
 
 ## 🚀 Features
 
-- **AI-Powered Predictions**: Uses a Random Forest Classifier trained on over 50,000 student records.
+- **Smart Resume Analysis**: Upload your PDF resume to automatically populate the form. Uses intelligent text extraction to identify skills, CGPA, internships, and projects.
+- **AI-Powered Predictions**: Uses a Random Forest Classifier trained on student records.
 - **Modern UI/UX**: Dark-themed dashboard with sleek animations and a two-column interactive layout.
 - **Real-time Probability**: Animated radial progress chart showing exact placement chances.
 - **Feature Importance**: Dynamic horizontal bar charts showing which factors influenced your result most.
@@ -16,7 +17,7 @@ A premium, AI-powered SaaS dashboard that predicts student placement probability
 ## 🛠️ Tech Stack
 
 - **Backend**: Python, Flask
-- **Machine Learning**: Scikit-learn, Pandas, NumPy
+- **Libraries**: pdfplumber (Resume Parsing), Scikit-learn, Pandas, NumPy
 - **Frontend**: HTML5, CSS3 (Glassmorphism, CSS Variables, Keyframe Animations)
 - **Model**: Random Forest (200 Estimators)
 
@@ -24,7 +25,7 @@ A premium, AI-powered SaaS dashboard that predicts student placement probability
 
 1. **Clone the repository**:
    ```bash
-   git clone <your-repo-url>
+   git clone https://github.com/jayshreek2511-cloud/Student-Placement-predictor.git
    cd placement-predictor
    ```
 
@@ -53,8 +54,10 @@ A premium, AI-powered SaaS dashboard that predicts student placement probability
 
 - `app.py`: The main Flask application (Backend + Frontend Templates).
 - `train.py`: Machine learning training script using RandomForest.
+- `test_model.py`: Script to test model predictions with sample data.
 - `model.pkl`: Serialized model and encoders.
 - `train.csv`: The dataset used for training.
+- `importance.png`: Feature importance visualization generated during training.
 - `requirements.txt`: Python dependencies.
 
 ## ⚖️ Model Factors
