@@ -1,6 +1,7 @@
 from flask import Flask, render_template_string, request, jsonify
 import pickle, json
 import pandas as pd, numpy as np
+import pdfplumber, re, os, tempfile, io
 
 app = Flask(__name__)
 
@@ -32,6 +33,159 @@ RESOURCE_LINKS = {
     'Backlogs':{'msg':'Focus on clearing pending backlogs ASAP.','link':'https://www.geeksforgeeks.org/'},
     'Soft_Skills_Rating':{'msg':'Develop interpersonal and teamwork abilities.','link':'https://www.coursera.org/courses?query=soft%20skills'},
 }
+
+def _clamp_number(value, low, high, decimals=False):
+    try:
+        value = re.sub(r'\s+', '', str(value))
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num < low or num > high:
+        return None
+    num = max(low, min(high, num))
+    return f"{num:.2f}".rstrip('0').rstrip('.') if decimals else str(int(round(num)))
+
+def _score_from_patterns(text, patterns, low, high, decimals=False):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            score = _clamp_number(match.group(1), low, high, decimals)
+            if score is not None:
+                return score
+    return None
+
+def _count_from_patterns(text, patterns, max_value=10):
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            count = _clamp_number(match.group(1), 0, max_value)
+            if count is not None:
+                return count
+    return None
+
+def _section_lines(lines, headings):
+    stop_headings = {
+        'education', 'experience', 'work experience', 'internship', 'internships',
+        'projects', 'project experience', 'certifications', 'certification',
+        'certificates', 'skills', 'technical skills', 'achievements', 'awards',
+        'summary', 'profile', 'objective', 'contact', 'languages', 'interests',
+        'extra curricular', 'extracurricular', 'positions of responsibility'
+    }
+    selected = []
+    in_section = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        clean = re.sub(r'[^a-z0-9 &/+-]', '', line.lower()).strip()
+        if not clean:
+            continue
+        is_heading = clean in stop_headings or (len(clean) <= 35 and clean.isalpha())
+        if any(h == clean or clean.startswith(h + ' ') for h in headings):
+            in_section = True
+            continue
+        if in_section and is_heading:
+            break
+        if in_section:
+            selected.append(line)
+    return selected
+
+def _count_section_items(lines, headings, max_value=10):
+    count = 0
+    bullet_re = re.compile(r'^(\s*[-*•]|\s*\d+[.)])\s+')
+    item_lines = []
+    for line in _section_lines(lines, headings):
+        compact = line.strip()
+        item_text = bullet_re.sub('', compact).strip()
+        if re.match(r'^(built|created|developed|implemented|used|using|worked|designed|integrated|managed|optimized|deployed)\b', item_text, re.I):
+            continue
+        if bullet_re.match(compact):
+            item_lines.append(compact)
+            continue
+        if len(compact) <= 90:
+            item_lines.append(compact)
+    count = len(item_lines)
+    return str(min(count, max_value)) if count > 0 else None
+
+def _extract_cgpa(text):
+    normalized = re.sub(r'\s+', ' ', text)
+    label_matches = list(re.finditer(r'\b(?:cgpa|gpa|cpi|grade point average)\b', normalized, re.I))
+    if not label_matches:
+        return None
+
+    number_matches = []
+    for match in re.finditer(r'(?<!\d)([0-9]+(?:\s*\.\s*[0-9]+)?)(?!\d)', normalized):
+        score = _clamp_number(match.group(1), 0, 10, decimals=True)
+        if not score:
+            continue
+        value = float(score)
+        if value < 4 and '.' not in score:
+            continue
+        number_matches.append((match.start(), score))
+
+    best = None
+    for label in label_matches:
+        for pos, score in number_matches:
+            distance = abs(pos - label.end())
+            if distance > 80:
+                continue
+            is_decimal = '.' in score
+            rank = (0 if is_decimal else 1, distance)
+            if best is None or rank < best[0]:
+                best = (rank, score)
+    return best[1] if best else None
+    return None
+
+def _count_certifications(lines):
+    section_count = _count_section_items(lines, ['certification', 'certifications', 'certificate', 'certificates'])
+    if section_count:
+        return section_count
+
+    count = 0
+    for line in lines:
+        clean = re.sub(r'[^a-z]', '', line.lower())
+        if clean in {'certification', 'certifications', 'certificate', 'certificates'}:
+            continue
+        if re.search(r'\b(certification|certificate)\b', line, re.I):
+            count += 1
+    return str(min(count, 10)) if count else None
+
+def _coding_rating_from_questions(text):
+    matches = re.findall(
+        r'(\d{2,4})\s*\+?\s*(?:coding\s*)?(?:questions|problems|dsa\s*problems|leetcode|codechef|hackerrank)',
+        text,
+        re.I
+    )
+    if not matches:
+        return None
+    questions = max(int(m) for m in matches)
+    if questions >= 400:
+        return '9'
+    if questions >= 300:
+        return '8.5'
+    if questions >= 200:
+        return '7.5'
+    if questions >= 150:
+        return '7'
+    if questions >= 100:
+        return '6.5'
+    if questions >= 70:
+        return '6'
+    if questions >= 50:
+        return '4'
+    return '3'
+
+def _detect_branch(text):
+    branch_patterns = [
+        ('AIML', r'\b(aiml|ai\s*ml|ai[-\s]*ml|artificial intelligence and machine learning|artificial intelligence\s*&\s*machine learning)\b'),
+        ('CSE', r'\b(cse|computer science|computer engineering|cs\b|b\.?tech\s+cs)\b'),
+        ('IT', r'\b(information technology|b\.?tech\s+it|it\b)\b'),
+        ('ECE', r'\b(ece|electronics and communication|electronics & communication)\b'),
+        ('ME', r'\b(mechanical engineering|mechanical|me\b)\b'),
+        ('Civil', r'\b(civil engineering|civil)\b'),
+    ]
+    for branch, pattern in branch_patterns:
+        if re.search(pattern, text, re.I):
+            return branch
+    return None
 
 PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Placement Predictor</title>
@@ -134,6 +288,7 @@ body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 .roadmap-btn:hover{background:var(--card2);border-color:var(--primary);}
 .back-link{display:block;text-align:center;margin-top:0.8rem;color:var(--dim);text-decoration:none;font-size:0.85rem;}
 .back-link:hover{color:var(--text);}
+.up-box{margin:1.2rem 0;padding:1rem;background:var(--card2);border:1px dashed var(--border);border-radius:12px;text-align:center;transition:0.3s;}.up-box:hover{border-color:var(--primary);}.up-box label{display:block;font-size:0.8rem;color:var(--dim);margin-bottom:0.5rem;cursor:pointer;}.up-box input{display:none;}.up-box .up-btn{font-size:0.85rem;font-weight:600;color:var(--primary);display:flex;align-items:center;justify-content:center;gap:0.4rem;cursor:pointer;}.up-status{font-size:0.75rem;margin-top:0.4rem;color:var(--cyan);display:none;}
 </style></head><body>
 <nav class="nav"><div class="nav-brand">🎯 Placement Predictor</div>
 <div class="nav-links"><a href="/" class="active">🏠 Predict</a><a href="/resources">📖 Roadmap</a></div></nav>
@@ -147,7 +302,7 @@ body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 <div class="section-head">🎓 Academic & Profile Details</div>
 <form id="pf">
 <div class="form-grid">
-<div class="fg"><label>Branch</label><div class="iw"><span class="ico">🏛</span><select name="Branch"><option>CSE</option><option>IT</option><option>ECE</option><option>ME</option><option>Civil</option></select></div></div>
+<div class="fg"><label>Branch</label><div class="iw"><span class="ico">🏛</span><select name="Branch"><option>CSE</option><option>AIML</option><option>IT</option><option>ECE</option><option>ME</option><option>Civil</option></select></div></div>
 <div class="fg"><label>CGPA (0 - 10)</label><div class="iw"><span class="ico">🎓</span><input type="number" step="0.01" name="CGPA" placeholder="e.g. 7.0" min="0" max="10" required></div></div>
 <div class="fg"><label>Internships</label><div class="iw"><span class="ico">🏢</span><input type="number" name="Internships" placeholder="e.g. 1" min="0" max="10" required></div></div>
 <div class="fg"><label>Projects</label><div class="iw"><span class="ico">🔧</span><input type="number" name="Projects" placeholder="e.g. 2" min="0" max="10" required></div></div>
@@ -159,6 +314,13 @@ body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 <div class="fg"><label>Backlogs</label><div class="iw"><span class="ico">🔄</span><input type="number" name="Backlogs" placeholder="e.g. 0" min="0" max="10" required></div></div>
 </div>
 <input type="hidden" name="Age" value="22"><input type="hidden" name="Gender" value="Male"><input type="hidden" name="Degree" value="B.Tech">
+<div class="up-box">
+<label>📄 Upload Resume (optional)</label>
+<div class="up-btn" onclick="document.getElementById('res').click()"><span>📂 Select PDF</span></div>
+<input type="file" id="res" accept=".pdf" onchange="uploadResume(this)">
+<div id="sk-tags" style="margin-top:0.5rem;display:flex;flex-wrap:wrap;gap:0.4rem;justify-content:center;"></div>
+<div class="up-status" id="ustat"></div>
+</div>
 <button type="submit" class="predict-btn" id="pbtn"><span id="btxt">🚀 Predict Status</span><div class="sp" id="sp"></div></button>
 </form>
 <div class="about-box"><div class="ab-title">ℹ️ About this model</div><p>This model is trained on student placement data and uses machine learning to predict placement chances based on your profile.</p></div>
@@ -186,6 +348,18 @@ body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 </div>
 
 <script>
+async function uploadResume(input){
+const f=input.files[0];if(!f)return;
+const st=document.getElementById('ustat'), sk=document.getElementById('sk-tags');
+st.textContent='⏳ Analyzing...';st.style.display='block';
+const fd=new FormData();fd.append('file',f);
+try{
+const res=await fetch('/upload/',{method:'POST',body:fd});
+const d=await res.json();if(d.error){st.textContent='❌ '+d.error;return;}st.textContent='✅ '+d.message;
+if(d.skills) sk.innerHTML=d.skills.map(s=>`<span style="font-size:0.7rem;background:var(--primary);padding:2px 6px;border-radius:4px;">${s}</span>`).join('');
+if(d.extracted_data){for(const [k,v] of Object.entries(d.extracted_data)){const el=document.querySelector(`[name="${k}"]`);if(el)el.value=v;}}
+}catch(e){st.textContent='❌ Upload failed';}
+}
 const CIRC=2*Math.PI*52;
 document.getElementById('pf').addEventListener('submit',async e=>{
 e.preventDefault();const btn=document.getElementById('pbtn'),bt=document.getElementById('btxt'),sp=document.getElementById('sp'),ly=document.getElementById('layout');
@@ -315,6 +489,111 @@ def resources():
     if not selected:
         selected = [{'title':p,'msg':v['msg'],'link':v['link']} for p,v in RESOURCE_LINKS.items()]
     return render_template_string(RESOURCES_TEMPLATE, resources=selected)
+
+@app.route('/upload/', methods=['POST'])
+def upload_resume():
+    if 'file' not in request.files: return jsonify({'error':'No file'}), 400
+    f = request.files['file']
+    if not f.filename.lower().endswith('.pdf'): return jsonify({'error':'Only PDF files accepted'}), 400
+    try:
+        # Read directly from memory to avoid Windows file-locking issues
+        resume_bytes = io.BytesIO(f.read())
+        text = ''
+        with pdfplumber.open(resume_bytes) as pdf:
+            for page in pdf.pages:
+                pg = page.extract_text()
+                if pg: text += pg + '\n'
+        text_lower = text.lower()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        # --- Extract skills ---
+        SKILL_LIST = ['python','java','c++','c','sql','javascript','html','css','react','node.js',
+                      'django','flask','machine learning','deep learning','data science','tensorflow',
+                      'pytorch','pandas','numpy','git','docker','kubernetes','aws','azure','gcp',
+                      'mongodb','mysql','postgresql','linux','r','matlab','excel','power bi','tableau',
+                      'natural language processing','nlp','computer vision','opencv','scikit-learn',
+                      'spring boot','angular','vue','typescript','php','ruby','go','rust','swift','kotlin']
+        found_skills = []
+        for skill in SKILL_LIST:
+            pattern = r'(?<![a-z0-9+#.])' + re.escape(skill) + r'(?![a-z0-9+#.])'
+            if re.search(pattern, text_lower):
+                found_skills.append(skill.title())
+        # --- Extract form fields ---
+        extracted = {}
+        branch = _detect_branch(text_lower)
+        if branch:
+            extracted['Branch'] = branch
+
+        cgpa = _extract_cgpa(text)
+        if cgpa:
+            extracted['CGPA'] = cgpa
+
+        internships = _count_from_patterns(text_lower, [
+            r'(\d+)\s*(?:\+?\s*)?(?:internships?|internship experience)',
+            r'(?:internships?|internship experience)\s*(?:completed|done|:|-)?\s*(\d+)',
+        ])
+        if not internships:
+            internships = _count_section_items(lines, ['internship', 'internships'])
+        if not internships:
+            intern_count = len(re.findall(r'\bintern(?:ship)?\b', text_lower))
+            if intern_count > 0: internships = str(min(intern_count, 10))
+        if internships:
+            extracted['Internships'] = internships
+
+        projects = _count_section_items(lines, ['project', 'projects'], max_value=4)
+        if projects:
+            extracted['Projects'] = projects
+
+        certifications = _count_certifications(lines)
+        if certifications:
+            extracted['Certifications'] = certifications
+
+        backlogs = _score_from_patterns(text_lower, [
+            r'(?:backlogs?|arrears?)\s*(?:standing|active|current|:|-)?\s*(\d+)',
+            r'(\d+)\s*(?:active\s*)?(?:backlogs?|arrears?)',
+        ], 0, 10)
+        if backlogs:
+            extracted['Backlogs'] = backlogs
+        elif re.search(r'\b(no|zero|nil)\s+(?:active\s*)?(?:backlogs?|arrears?)\b', text_lower):
+            extracted['Backlogs'] = '0'
+
+        aptitude = _score_from_patterns(text_lower, [
+            r'(?:aptitude|aptitude test|quantitative aptitude)\s*(?:score|rating|:|-)?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:/|out of)\s*100\s*(?:aptitude|aptitude test)',
+        ], 0, 100)
+        if aptitude:
+            extracted['Aptitude_Test_Score'] = aptitude
+
+        communication = _score_from_patterns(text_lower, [
+            r'(?:communication skills?|communication)\s*(?:score|rating|:|-)?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:/|out of)\s*10\s*(?:communication skills?|communication)',
+        ], 1, 10)
+        if communication:
+            extracted['Communication_Skills'] = communication
+
+        soft_skills = _score_from_patterns(text_lower, [
+            r'(?:soft skills?|soft skill rating)\s*(?:score|rating|:|-)?\s*([0-9]+(?:\.[0-9]+)?)',
+            r'([0-9]+(?:\.[0-9]+)?)\s*(?:/|out of)\s*10\s*(?:soft skills?)',
+        ], 1, 10)
+        if soft_skills:
+            extracted['Soft_Skills_Rating'] = soft_skills
+
+        coding_skill = _coding_rating_from_questions(text_lower)
+        if not coding_skill:
+            coding_skill = _score_from_patterns(text_lower, [
+                r'(?:coding skills?|programming skills?|technical skills?)\s*(?:score|rating|:|-)?\s*([0-9]+(?:\.[0-9]+)?)',
+                r'([0-9]+(?:\.[0-9]+)?)\s*(?:/|out of)\s*10\s*(?:coding skills?|programming skills?)',
+            ], 1, 10, decimals=True)
+        if not coding_skill and found_skills:
+            coding_skill = str(min(10, max(1, len(found_skills))))
+        if coding_skill:
+            extracted['Coding_Skills'] = coding_skill
+        return jsonify({
+            "skills": found_skills if found_skills else ["No specific skills detected"],
+            "message": "Resume analyzed successfully",
+            "extracted_data": extracted
+        })
+    except Exception as e:
+        return jsonify({'error': f'Failed to parse resume: {str(e)}'}), 400
 
 if __name__ == '__main__':
     app.run(debug=True)
