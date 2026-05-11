@@ -13,12 +13,13 @@ def train_model():
     # Load data
     df = pd.read_csv('train.csv')
     
-    # Drop Student_ID as it's just an identifier
+    # Drop identifier and non-actionable demographic fields.
     if 'Student_ID' in df.columns:
         df = df.drop('Student_ID', axis=1)
+    df = df.drop(columns=[col for col in ['Age', 'Gender'] if col in df.columns])
         
     # Categorical columns to encode
-    categorical_cols = ['Gender', 'Degree', 'Branch']
+    categorical_cols = ['Degree', 'Branch']
     
     # Dictionary to store encoders
     encoders = {}
@@ -85,7 +86,9 @@ def train_model():
         'model': model,
         'encoders': encoders,
         'feature_names': X.columns.tolist(),
-        'feature_importances': dict(zip(X.columns.tolist(), importances.tolist()))
+        'feature_importances': dict(zip(X.columns.tolist(), importances.tolist())),
+        'dropped_features': ['Age', 'Gender'],
+        'metrics': {'accuracy': round(accuracy * 100, 2)}
     }
     
     with open('model.pkl', 'wb') as f:
