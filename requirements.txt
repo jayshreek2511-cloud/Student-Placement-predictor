@@ -4,3 +4,5 @@ flask
 numpy
 matplotlib
 pdfplumber
+gunicorn
+werkzeug

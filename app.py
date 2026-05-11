@@ -4,12 +4,22 @@ import pandas as pd, numpy as np
 import pdfplumber, re, os, tempfile, io
 import sqlite3, hashlib
 from datetime import datetime
+from werkzeug.security import check_password_hash, generate_password_hash
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, confusion_matrix
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('APP_SECRET_KEY', 'placement-predictor-dev-key')
-DB_PATH = 'placement_app.db'
+IS_PROD = os.environ.get('FLASK_ENV') == 'production'
+app.secret_key = os.environ.get('APP_SECRET_KEY') or ('placement-predictor-dev-key' if not IS_PROD else os.urandom(32))
+app.config.update(
+    MAX_CONTENT_LENGTH=4 * 1024 * 1024,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=IS_PROD,
+)
+DB_PATH = os.environ.get('DATABASE_PATH', 'placement_app.db')
+
+DEFAULT_MODEL_FIELDS = {'Age': '22', 'Gender': 'Male', 'Degree': 'B.Tech'}
 
 with open('model.pkl', 'rb') as f:
     md = pickle.load(f)
@@ -45,6 +55,13 @@ def db():
     conn.row_factory = sqlite3.Row
     return conn
 
+@app.after_request
+def add_security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    return response
+
 def init_db():
     with db() as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS users (
@@ -66,7 +83,18 @@ def init_db():
         )''')
 
 def hash_password(password):
+    return generate_password_hash(password)
+
+def legacy_hash_password(password):
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+def password_matches(user, password):
+    stored_hash = user['password_hash']
+    if stored_hash == legacy_hash_password(password):
+        with db() as conn:
+            conn.execute('UPDATE users SET password_hash=? WHERE id=?', (hash_password(password), user['id']))
+        return True
+    return check_password_hash(stored_hash, password)
 
 def current_user():
     user_id = session.get('user_id')
@@ -571,6 +599,8 @@ body{background:var(--bg);color:var(--text);min-height:100vh;}
 AUTH_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>{{ title }}</title><style>*{box-sizing:border-box;font-family:Arial,sans-serif}body{margin:0;background:#020617;color:#F8FAFC}.nav{background:#0F172A;border-bottom:1px solid #1E293B;padding:1rem 2rem;display:flex;gap:1.5rem}.nav a{color:#94A3B8;text-decoration:none;font-weight:700}.card{max-width:420px;margin:4rem auto;background:#0F172A;border:1px solid #1E293B;border-radius:16px;padding:2rem}.card h1{color:#22D3EE}.fg{margin-bottom:1rem}.fg label{display:block;color:#94A3B8;font-size:.85rem;margin-bottom:.35rem}.fg input{width:100%;background:#131C31;border:1px solid #1E293B;border-radius:10px;color:white;padding:.8rem}.btn{width:100%;border:0;border-radius:12px;background:linear-gradient(135deg,#6366F1,#D946EF);color:white;padding:.9rem;font-weight:700}.err{background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.4);padding:.7rem;border-radius:10px;margin-bottom:1rem}.small{text-align:center;margin-top:1rem}.small a{color:#6366F1}</style></head><body><nav class="nav"><a href="/">Predict</a><a href="/resources">Roadmap</a><a href="/model">Model</a></nav><div class="card"><h1>{{ title }}</h1><p>{{ subtitle }}</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{% if mode == 'register' %}<div class="fg"><label>Name</label><input name="name" required></div>{% endif %}<div class="fg"><label>Email</label><input type="email" name="email" required></div><div class="fg"><label>Password</label><input type="password" name="password" required></div><button class="btn" type="submit">{{ button }}</button></form><div class="small">{% if mode == 'login' %}New here? <a href="/register">Create account</a>{% else %}Already have an account? <a href="/login">Login</a>{% endif %}</div></div></body></html>"""
 
+LOGOUT_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Confirm Logout</title><style>*{box-sizing:border-box;font-family:Arial,sans-serif}body{margin:0;background:#020617;color:#F8FAFC}.nav{background:#0F172A;border-bottom:1px solid #1E293B;padding:1rem 2rem;display:flex;gap:1.5rem}.nav a{color:#94A3B8;text-decoration:none;font-weight:700}.card{max-width:420px;margin:5rem auto;background:#0F172A;border:1px solid #1E293B;border-radius:16px;padding:2rem;text-align:center}.card h1{color:#22D3EE;margin-top:0}.card p{color:#94A3B8;margin-bottom:1.5rem}.actions{display:flex;gap:.8rem}.btn,.link{flex:1;border:0;border-radius:12px;padding:.85rem 1rem;font-weight:700;text-decoration:none;cursor:pointer}.btn{background:#EF4444;color:white}.link{background:#131C31;border:1px solid #1E293B;color:#F8FAFC}</style></head><body><nav class="nav"><a href="/">Predict</a><a href="/resources">Roadmap</a><a href="/model">Model</a>{% if user %}<a href="/history">History</a>{% endif %}</nav><div class="card"><h1>Logout?</h1><p>Are you sure you want to logout?</p><div class="actions"><form method="post" style="flex:1"><button class="btn" type="submit">Yes</button></form><a class="link" href="{{ back_url }}">No</a></div></div></body></html>"""
+
 HISTORY_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>History</title><style>*{box-sizing:border-box;font-family:Arial,sans-serif}body{margin:0;background:#020617;color:#F8FAFC}.nav{background:#0F172A;border-bottom:1px solid #1E293B;padding:1rem 2rem;display:flex;gap:1.5rem}.nav a{color:#94A3B8;text-decoration:none;font-weight:700}.nav a.active{color:#6366F1}.page{max-width:1100px;margin:auto;padding:2rem}.page h1{color:#22D3EE}.card,.empty{background:#0F172A;border:1px solid #1E293B;border-radius:14px;padding:1rem;margin-bottom:1rem}.top{display:flex;justify-content:space-between}.placed{color:#22C55E}.not{color:#EF4444}.meta{color:#94A3B8}.chips{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:.8rem}.chip{background:#131C31;border:1px solid #1E293B;border-radius:8px;padding:.35rem .55rem;font-size:.8rem}</style></head><body><nav class="nav"><a href="/">Predict</a><a href="/resources">Roadmap</a><a href="/model">Model</a><a class="active" href="/history">History</a><a href="/logout">Logout</a></nav><main class="page"><h1>Prediction History</h1><p class="meta">Saved predictions for {{ user['name'] }}</p>{% if rows %}{% for row in rows %}<div class="card"><div class="top"><div><b class="{% if row['status']=='Placed' %}placed{% else %}not{% endif %}">{{ row['status'] }}</b> <span class="meta">{{ row['created_at'] }}</span></div><b>{{ row['probability'] }}%</b></div><div class="chips">{% for k,v in row['data'].items() %}<span class="chip">{{ k.replace('_',' ') }}: {{ v }}</span>{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No saved predictions yet.</div>{% endif %}</main></body></html>"""
 
 MODEL_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Model</title><style>*{box-sizing:border-box;font-family:Arial,sans-serif}body{margin:0;background:#020617;color:#F8FAFC}.nav{background:#0F172A;border-bottom:1px solid #1E293B;padding:1rem 2rem;display:flex;gap:1.5rem}.nav a{color:#94A3B8;text-decoration:none;font-weight:700}.nav a.active{color:#6366F1}.page{max-width:1000px;margin:auto;padding:2rem}.page h1{color:#22D3EE}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}.stat,.card{background:#0F172A;border:1px solid #1E293B;border-radius:14px;padding:1rem;margin-bottom:1rem}.stat span{display:block;color:#94A3B8}.stat b{font-size:1.5rem}.bar{display:grid;grid-template-columns:170px 1fr;gap:.7rem;align-items:center;margin:.55rem 0}.track{height:12px;background:#131C31;border-radius:999px;overflow:hidden}.fill{height:100%;background:linear-gradient(90deg,#6366F1,#22D3EE)}.matrix{display:grid;grid-template-columns:repeat(2,1fr);gap:.7rem}.cell{background:#131C31;border:1px solid #1E293B;border-radius:10px;padding:1rem;text-align:center}</style></head><body><nav class="nav"><a href="/">Predict</a><a href="/resources">Roadmap</a><a class="active" href="/model">Model</a>{% if user %}<a href="/history">History</a>{% endif %}</nav><main class="page"><h1>Model Details</h1><p style="color:#94A3B8">Transparent metrics from the training dataset and saved Random Forest model.</p>{% if metrics.error %}<div class="card">{{ metrics.error }}</div>{% else %}<div class="stats"><div class="stat"><span>Model</span><b>{{ metrics.model_name }}</b></div><div class="stat"><span>Dataset Rows</span><b>{{ metrics.dataset_size }}</b></div><div class="stat"><span>Accuracy</span><b>{{ metrics.accuracy }}%</b></div><div class="stat"><span>Precision / Recall</span><b>{{ metrics.precision }} / {{ metrics.recall }}</b></div></div><div class="card"><h3>Confusion Matrix</h3><div class="matrix"><div class="cell">TN<br><b>{{ metrics.confusion_matrix[0][0] }}</b></div><div class="cell">FP<br><b>{{ metrics.confusion_matrix[0][1] }}</b></div><div class="cell">FN<br><b>{{ metrics.confusion_matrix[1][0] }}</b></div><div class="cell">TP<br><b>{{ metrics.confusion_matrix[1][1] }}</b></div></div></div>{% endif %}<div class="card"><h3>Feature Importance</h3>{% for k,v in importances %}<div class="bar"><span>{{ k.replace('_',' ') }}</span><div class="track"><div class="fill" style="width:{{ v }}%"></div></div></div>{% endfor %}</div></main></body></html>"""
@@ -609,16 +639,26 @@ def login():
         password = request.form.get('password', '')
         with db() as conn:
             user = conn.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
-        if user and user['password_hash'] == hash_password(password):
+        if user and password_matches(user, password):
             session['user_id'] = user['id']
             return redirect(url_for('home'))
         error = 'Invalid email or password.'
     return render_template_string(AUTH_TEMPLATE, title='Login', subtitle='Continue tracking your placement readiness.', button='Login', mode='login', error=error)
 
-@app.route('/logout')
+@app.route('/health')
+def health():
+    return jsonify({'ok': True})
+
+@app.route('/logout', methods=['GET', 'POST'])
 def logout():
-    session.clear()
-    return redirect(url_for('home'))
+    if request.method == 'POST':
+        session.clear()
+        return redirect(url_for('home'))
+    user = current_user()
+    if not user:
+        return redirect(url_for('home'))
+    back_url = request.referrer or url_for('home')
+    return render_template_string(LOGOUT_TEMPLATE, user=user, back_url=back_url)
 
 @app.route('/history')
 def history():
@@ -630,7 +670,7 @@ def history():
     parsed = []
     for row in rows:
         item = dict(row)
-        item['data'] = json.loads(item['data'])
+        item['data'] = {k: v for k, v in json.loads(item['data']).items() if k not in {'Age', 'Gender'}}
         parsed.append(item)
     return render_template_string(HISTORY_TEMPLATE, user=user, rows=parsed)
 
@@ -643,7 +683,15 @@ def model_details():
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        data = request.json
+        data = {**DEFAULT_MODEL_FIELDS, **(request.get_json(silent=True) or {})}
+        missing = [key for key in feature_names if key not in data or data[key] in (None, '')]
+        if missing:
+            return jsonify({'error': 'Please complete all required fields.'}), 400
+        for key in THRESH:
+            try:
+                float(data[key])
+            except (TypeError, ValueError):
+                return jsonify({'error': f'{key.replace("_", " ")} must be a valid number.'}), 400
         input_df = pd.DataFrame([data])
         for col, le in encoders.items():
             if col in input_df.columns:
@@ -665,10 +713,11 @@ def predict():
                 weak_keys.append(key)
         message = "Congratulations! You have high chances of getting placed." if status == 'Placed' else "You have areas to improve — check suggestions below."
         if session.get('user_id'):
+            history_data = {k: v for k, v in data.items() if k not in {'Age', 'Gender'}}
             with db() as conn:
                 conn.execute(
                     'INSERT INTO predictions (user_id, created_at, status, probability, data, weak_keys) VALUES (?, ?, ?, ?, ?, ?)',
-                    (session['user_id'], datetime.now().strftime('%Y-%m-%d %H:%M'), status, probability, json.dumps(data), json.dumps(weak_keys))
+                    (session['user_id'], datetime.now().strftime('%Y-%m-%d %H:%M'), status, probability, json.dumps(history_data), json.dumps(weak_keys))
                 )
         return jsonify({'status':status,'message':message,'probability':probability,'feature_importances':feat_imp,'improvements':improvements,'weak_keys':weak_keys})
     except Exception as e:
@@ -676,7 +725,10 @@ def predict():
 
 @app.route('/resources')
 def resources():
-    points = json.loads(request.args.get('points', '[]'))
+    try:
+        points = json.loads(request.args.get('points', '[]'))
+    except json.JSONDecodeError:
+        points = []
     selected = [{'title':p,'msg':RESOURCE_LINKS[p]['msg'],'link':RESOURCE_LINKS[p]['link']} for p in points if p in RESOURCE_LINKS]
     if not selected:
         selected = [{'title':p,'msg':v['msg'],'link':v['link']} for p,v in RESOURCE_LINKS.items()]
@@ -791,4 +843,5 @@ def upload_resume():
 init_db()
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=not IS_PROD)
