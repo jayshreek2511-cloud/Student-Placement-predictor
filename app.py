@@ -1,9 +1,15 @@
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
 import pickle, json
 import pandas as pd, numpy as np
 import pdfplumber, re, os, tempfile, io
+import sqlite3, hashlib
+from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, confusion_matrix
 
 app = Flask(__name__)
+app.secret_key = os.environ.get('APP_SECRET_KEY', 'placement-predictor-dev-key')
+DB_PATH = 'placement_app.db'
 
 with open('model.pkl', 'rb') as f:
     md = pickle.load(f)
@@ -33,6 +39,72 @@ RESOURCE_LINKS = {
     'Backlogs':{'msg':'Focus on clearing pending backlogs ASAP.','link':'https://www.geeksforgeeks.org/'},
     'Soft_Skills_Rating':{'msg':'Develop interpersonal and teamwork abilities.','link':'https://www.coursera.org/courses?query=soft%20skills'},
 }
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            probability REAL NOT NULL,
+            data TEXT NOT NULL,
+            weak_keys TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )''')
+
+def hash_password(password):
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+def current_user():
+    user_id = session.get('user_id')
+    if not user_id:
+        return None
+    with db() as conn:
+        return conn.execute('SELECT id, name, email FROM users WHERE id=?', (user_id,)).fetchone()
+
+def get_model_metrics():
+    try:
+        df = pd.read_csv('train.csv')
+        dataset_size = len(df)
+        if 'Student_ID' in df.columns:
+            df = df.drop('Student_ID', axis=1)
+        for col, le in encoders.items():
+            if col in df.columns:
+                df[col] = le.transform(df[col])
+        target = encoders['Placement_Status']
+        df['Placement_Status'] = target.transform(df['Placement_Status'])
+        X = df[feature_names]
+        y = df['Placement_Status']
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        preds = model.predict(X_test)
+        placed_idx = list(target.classes_).index('Placed')
+        cm = confusion_matrix(y_test, preds, labels=[0, 1]).tolist()
+        return {
+            'dataset_size': dataset_size,
+            'test_size': len(y_test),
+            'accuracy': round(accuracy_score(y_test, preds) * 100, 1),
+            'precision': round(precision_score(y_test, preds, pos_label=placed_idx, zero_division=0) * 100, 1),
+            'recall': round(recall_score(y_test, preds, pos_label=placed_idx, zero_division=0) * 100, 1),
+            'confusion_matrix': cm,
+            'model_name': model.__class__.__name__
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+MODEL_METRICS = get_model_metrics()
 
 def _clamp_number(value, low, high, decimals=False):
     try:
@@ -187,6 +259,38 @@ def _detect_branch(text):
             return branch
     return None
 
+def _extract_profile(text, lines):
+    email = re.search(r'[\w.+-]+@[\w-]+\.[\w.-]+', text)
+    phone = re.search(r'(?:\+91[\s-]?)?[6-9]\d{9}', re.sub(r'\s+', '', text))
+    name = None
+    for line in lines[:6]:
+        clean = re.sub(r'[^A-Za-z ]', '', line).strip()
+        if 2 <= len(clean.split()) <= 4 and not re.search(r'(resume|curriculum|email|phone|cgpa|engineer|student)', clean, re.I):
+            name = clean
+            break
+    return {
+        'Name': name,
+        'Email': email.group(0) if email else None,
+        'Phone': phone.group(0) if phone else None
+    }
+
+def personalized_tip(key, value, data):
+    branch = data.get('Branch', 'your branch')
+    tips = {
+        'CGPA': f"Your CGPA is {value}. Aim for 7.5+ and list your strongest academic subjects clearly on the resume.",
+        'Coding_Skills': f"Your coding score is {value}/10. Push solved problems toward 150+ and add platform links like LeetCode or HackerRank.",
+        'Communication_Skills': f"Communication is {value}/10. Practice mock HR rounds and add presentation or teamwork proof if you have it.",
+        'Aptitude_Test_Score': f"Your aptitude score is {value}. Practice quantitative and logical reasoning until you consistently cross 75.",
+        'Projects': f"You have {value} projects. For {branch}, keep at least 3 strong projects with GitHub links, tech stack, and measurable outcomes.",
+        'Internships': f"You have {value} internships. Apply for one practical internship or add freelance/open-source experience if internships are not available.",
+        'Certifications': f"You have {value} certifications. Add 2 relevant certifications, preferably aligned with {branch}.",
+        'Backlogs': f"You have {value} backlog(s). Clearing active backlogs should be the first priority because many companies filter on this.",
+        'Soft_Skills_Rating': f"Soft skills are {value}/10. Highlight leadership, teamwork, clubs, events, or volunteering with specific examples.",
+    }
+    if branch == 'AIML' and key in {'Projects', 'Certifications', 'Coding_Skills'}:
+        tips[key] += " For AIML, TensorFlow/PyTorch, data preprocessing, model evaluation, and deployment projects will help a lot."
+    return tips.get(key, THRESH[key]['tip'])
+
 PAGE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Placement Predictor</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -208,6 +312,8 @@ body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 .nav-links{display:flex;gap:1.5rem;}
 .nav-links a{text-decoration:none;font-size:0.9rem;font-weight:500;color:var(--dim);display:flex;align-items:center;gap:0.4rem;padding:0.4rem 0;border-bottom:2px solid transparent;transition:0.3s;}
 .nav-links a.active,.nav-links a:hover{color:var(--primary);border-bottom-color:var(--primary);}
+.nav-user{margin-left:auto;display:flex;align-items:center;gap:0.8rem;color:var(--muted);font-size:0.85rem;}
+.nav-user a{color:var(--primary);text-decoration:none;font-weight:600;}
 
 /* FULL PAGE SINGLE SCROLL */
 .page-wrap{max-width:1300px;margin:0 auto;padding:2rem 2rem 4rem;}
@@ -289,9 +395,14 @@ body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 .back-link{display:block;text-align:center;margin-top:0.8rem;color:var(--dim);text-decoration:none;font-size:0.85rem;}
 .back-link:hover{color:var(--text);}
 .up-box{margin:1.2rem 0;padding:1rem;background:var(--card2);border:1px dashed var(--border);border-radius:12px;text-align:center;transition:0.3s;}.up-box:hover{border-color:var(--primary);}.up-box label{display:block;font-size:0.8rem;color:var(--dim);margin-bottom:0.5rem;cursor:pointer;}.up-box input{display:none;}.up-box .up-btn{font-size:0.85rem;font-weight:600;color:var(--primary);display:flex;align-items:center;justify-content:center;gap:0.4rem;cursor:pointer;}.up-status{font-size:0.75rem;margin-top:0.4rem;color:var(--cyan);display:none;}
+.extract-grid{margin-top:0.8rem;display:none;grid-template-columns:repeat(4,1fr);gap:0.45rem;text-align:left;}
+.extract-pill{background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.3);border-radius:8px;padding:0.45rem 0.55rem;font-size:0.72rem;color:var(--muted);}
+.extract-pill b{display:block;color:var(--text);font-size:0.78rem;margin-top:0.1rem;}
+@media(max-width:700px){.extract-grid{grid-template-columns:1fr 1fr;}.nav{flex-wrap:wrap;}.nav-user{margin-left:0;width:100%;}}
 </style></head><body>
 <nav class="nav"><div class="nav-brand">🎯 Placement Predictor</div>
-<div class="nav-links"><a href="/" class="active">🏠 Predict</a><a href="/resources">📖 Roadmap</a></div></nav>
+<div class="nav-links"><a href="/" class="active">🏠 Predict</a><a href="/resources">📖 Roadmap</a><a href="/model">📊 Model</a>{% if user %}<a href="/history">🕓 History</a>{% endif %}</div>
+<div class="nav-user">{% if user %}<span>{{ user['name'] }}</span><a href="/logout">Logout</a>{% else %}<a href="/login">Login</a><a href="/register">Register</a>{% endif %}</div></nav>
 
 <div class="page-wrap">
 <div class="layout" id="layout">
@@ -319,6 +430,7 @@ body{background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 <div class="up-btn" onclick="document.getElementById('res').click()"><span>📂 Select PDF</span></div>
 <input type="file" id="res" accept=".pdf" onchange="uploadResume(this)">
 <div id="sk-tags" style="margin-top:0.5rem;display:flex;flex-wrap:wrap;gap:0.4rem;justify-content:center;"></div>
+<div class="extract-grid" id="extractGrid"></div>
 <div class="up-status" id="ustat"></div>
 </div>
 <button type="submit" class="predict-btn" id="pbtn"><span id="btxt">🚀 Predict Status</span><div class="sp" id="sp"></div></button>
@@ -357,7 +469,13 @@ try{
 const res=await fetch('/upload/',{method:'POST',body:fd});
 const d=await res.json();if(d.error){st.textContent='❌ '+d.error;return;}st.textContent='✅ '+d.message;
 if(d.skills) sk.innerHTML=d.skills.map(s=>`<span style="font-size:0.7rem;background:var(--primary);padding:2px 6px;border-radius:4px;">${s}</span>`).join('');
-if(d.extracted_data){for(const [k,v] of Object.entries(d.extracted_data)){const el=document.querySelector(`[name="${k}"]`);if(el)el.value=v;}}
+if(d.extracted_data){
+const eg=document.getElementById('extractGrid');
+const preview={...(d.profile||{}),...d.extracted_data};
+eg.innerHTML=Object.entries(preview).filter(([k,v])=>v).map(([k,v])=>`<div class="extract-pill">${k.replace(/_/g,' ')}<b>${v}</b></div>`).join('');
+eg.style.display=Object.keys(preview).length?'grid':'none';
+for(const [k,v] of Object.entries(d.extracted_data)){const el=document.querySelector(`[name="${k}"]`);if(el)el.value=v;}
+}
 }catch(e){st.textContent='❌ Upload failed';}
 }
 const CIRC=2*Math.PI*52;
@@ -442,7 +560,7 @@ body{background:var(--bg);color:var(--text);min-height:100vh;}
 .back{display:block;text-align:center;margin-top:2rem;color:var(--muted);text-decoration:none;}.back:hover{color:var(--text);}
 </style></head><body>
 <nav class="nav"><div class="nav-brand">🎯 Placement Predictor</div>
-<div class="nav-links"><a href="/">🏠 Predict</a><a href="/resources" class="active">📖 Roadmap</a></div></nav>
+<div class="nav-links"><a href="/">🏠 Predict</a><a href="/resources" class="active">📖 Roadmap</a><a href="/model">📊 Model</a>{% if user %}<a href="/history">🕓 History</a>{% endif %}</div></nav>
 <div class="page"><h1>Roadmap to Success</h1><p class="sub">Tailored resources to help you bridge the gaps</p>
 {% for point in resources %}
 <div class="rcard"><h3>🚀 {{ point.title.replace('_', ' ') }}</h3><p>{{ point.msg }}</p>
@@ -450,9 +568,77 @@ body{background:var(--bg);color:var(--text);min-height:100vh;}
 {% endfor %}
 <a href="/" class="back">← Back to Predictor</a></div></body></html>"""
 
+AUTH_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{{ title }}</title><style>*{box-sizing:border-box;font-family:Arial,sans-serif}body{margin:0;background:#020617;color:#F8FAFC}.nav{background:#0F172A;border-bottom:1px solid #1E293B;padding:1rem 2rem;display:flex;gap:1.5rem}.nav a{color:#94A3B8;text-decoration:none;font-weight:700}.card{max-width:420px;margin:4rem auto;background:#0F172A;border:1px solid #1E293B;border-radius:16px;padding:2rem}.card h1{color:#22D3EE}.fg{margin-bottom:1rem}.fg label{display:block;color:#94A3B8;font-size:.85rem;margin-bottom:.35rem}.fg input{width:100%;background:#131C31;border:1px solid #1E293B;border-radius:10px;color:white;padding:.8rem}.btn{width:100%;border:0;border-radius:12px;background:linear-gradient(135deg,#6366F1,#D946EF);color:white;padding:.9rem;font-weight:700}.err{background:rgba(239,68,68,.14);border:1px solid rgba(239,68,68,.4);padding:.7rem;border-radius:10px;margin-bottom:1rem}.small{text-align:center;margin-top:1rem}.small a{color:#6366F1}</style></head><body><nav class="nav"><a href="/">Predict</a><a href="/resources">Roadmap</a><a href="/model">Model</a></nav><div class="card"><h1>{{ title }}</h1><p>{{ subtitle }}</p>{% if error %}<div class="err">{{ error }}</div>{% endif %}<form method="post">{% if mode == 'register' %}<div class="fg"><label>Name</label><input name="name" required></div>{% endif %}<div class="fg"><label>Email</label><input type="email" name="email" required></div><div class="fg"><label>Password</label><input type="password" name="password" required></div><button class="btn" type="submit">{{ button }}</button></form><div class="small">{% if mode == 'login' %}New here? <a href="/register">Create account</a>{% else %}Already have an account? <a href="/login">Login</a>{% endif %}</div></div></body></html>"""
+
+HISTORY_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>History</title><style>*{box-sizing:border-box;font-family:Arial,sans-serif}body{margin:0;background:#020617;color:#F8FAFC}.nav{background:#0F172A;border-bottom:1px solid #1E293B;padding:1rem 2rem;display:flex;gap:1.5rem}.nav a{color:#94A3B8;text-decoration:none;font-weight:700}.nav a.active{color:#6366F1}.page{max-width:1100px;margin:auto;padding:2rem}.page h1{color:#22D3EE}.card,.empty{background:#0F172A;border:1px solid #1E293B;border-radius:14px;padding:1rem;margin-bottom:1rem}.top{display:flex;justify-content:space-between}.placed{color:#22C55E}.not{color:#EF4444}.meta{color:#94A3B8}.chips{display:flex;flex-wrap:wrap;gap:.45rem;margin-top:.8rem}.chip{background:#131C31;border:1px solid #1E293B;border-radius:8px;padding:.35rem .55rem;font-size:.8rem}</style></head><body><nav class="nav"><a href="/">Predict</a><a href="/resources">Roadmap</a><a href="/model">Model</a><a class="active" href="/history">History</a><a href="/logout">Logout</a></nav><main class="page"><h1>Prediction History</h1><p class="meta">Saved predictions for {{ user['name'] }}</p>{% if rows %}{% for row in rows %}<div class="card"><div class="top"><div><b class="{% if row['status']=='Placed' %}placed{% else %}not{% endif %}">{{ row['status'] }}</b> <span class="meta">{{ row['created_at'] }}</span></div><b>{{ row['probability'] }}%</b></div><div class="chips">{% for k,v in row['data'].items() %}<span class="chip">{{ k.replace('_',' ') }}: {{ v }}</span>{% endfor %}</div></div>{% endfor %}{% else %}<div class="empty">No saved predictions yet.</div>{% endif %}</main></body></html>"""
+
+MODEL_TEMPLATE = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Model</title><style>*{box-sizing:border-box;font-family:Arial,sans-serif}body{margin:0;background:#020617;color:#F8FAFC}.nav{background:#0F172A;border-bottom:1px solid #1E293B;padding:1rem 2rem;display:flex;gap:1.5rem}.nav a{color:#94A3B8;text-decoration:none;font-weight:700}.nav a.active{color:#6366F1}.page{max-width:1000px;margin:auto;padding:2rem}.page h1{color:#22D3EE}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem}.stat,.card{background:#0F172A;border:1px solid #1E293B;border-radius:14px;padding:1rem;margin-bottom:1rem}.stat span{display:block;color:#94A3B8}.stat b{font-size:1.5rem}.bar{display:grid;grid-template-columns:170px 1fr;gap:.7rem;align-items:center;margin:.55rem 0}.track{height:12px;background:#131C31;border-radius:999px;overflow:hidden}.fill{height:100%;background:linear-gradient(90deg,#6366F1,#22D3EE)}.matrix{display:grid;grid-template-columns:repeat(2,1fr);gap:.7rem}.cell{background:#131C31;border:1px solid #1E293B;border-radius:10px;padding:1rem;text-align:center}</style></head><body><nav class="nav"><a href="/">Predict</a><a href="/resources">Roadmap</a><a class="active" href="/model">Model</a>{% if user %}<a href="/history">History</a>{% endif %}</nav><main class="page"><h1>Model Details</h1><p style="color:#94A3B8">Transparent metrics from the training dataset and saved Random Forest model.</p>{% if metrics.error %}<div class="card">{{ metrics.error }}</div>{% else %}<div class="stats"><div class="stat"><span>Model</span><b>{{ metrics.model_name }}</b></div><div class="stat"><span>Dataset Rows</span><b>{{ metrics.dataset_size }}</b></div><div class="stat"><span>Accuracy</span><b>{{ metrics.accuracy }}%</b></div><div class="stat"><span>Precision / Recall</span><b>{{ metrics.precision }} / {{ metrics.recall }}</b></div></div><div class="card"><h3>Confusion Matrix</h3><div class="matrix"><div class="cell">TN<br><b>{{ metrics.confusion_matrix[0][0] }}</b></div><div class="cell">FP<br><b>{{ metrics.confusion_matrix[0][1] }}</b></div><div class="cell">FN<br><b>{{ metrics.confusion_matrix[1][0] }}</b></div><div class="cell">TP<br><b>{{ metrics.confusion_matrix[1][1] }}</b></div></div></div>{% endif %}<div class="card"><h3>Feature Importance</h3>{% for k,v in importances %}<div class="bar"><span>{{ k.replace('_',' ') }}</span><div class="track"><div class="fill" style="width:{{ v }}%"></div></div></div>{% endfor %}</div></main></body></html>"""
+
 @app.route('/')
 def home():
-    return render_template_string(PAGE)
+    return render_template_string(PAGE, user=current_user())
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    error = None
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        if len(password) < 4:
+            error = 'Use at least 4 characters for the password.'
+        else:
+            try:
+                with db() as conn:
+                    cur = conn.execute(
+                        'INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)',
+                        (name, email, hash_password(password), datetime.now().strftime('%Y-%m-%d %H:%M'))
+                    )
+                    session['user_id'] = cur.lastrowid
+                return redirect(url_for('home'))
+            except sqlite3.IntegrityError:
+                error = 'An account with this email already exists.'
+    return render_template_string(AUTH_TEMPLATE, title='Create Account', subtitle='Save prediction history and track progress.', button='Register', mode='register', error=error)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip().lower()
+        password = request.form.get('password', '')
+        with db() as conn:
+            user = conn.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
+        if user and user['password_hash'] == hash_password(password):
+            session['user_id'] = user['id']
+            return redirect(url_for('home'))
+        error = 'Invalid email or password.'
+    return render_template_string(AUTH_TEMPLATE, title='Login', subtitle='Continue tracking your placement readiness.', button='Login', mode='login', error=error)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('home'))
+
+@app.route('/history')
+def history():
+    user = current_user()
+    if not user:
+        return redirect(url_for('login'))
+    with db() as conn:
+        rows = conn.execute('SELECT * FROM predictions WHERE user_id=? ORDER BY id DESC LIMIT 20', (user['id'],)).fetchall()
+    parsed = []
+    for row in rows:
+        item = dict(row)
+        item['data'] = json.loads(item['data'])
+        parsed.append(item)
+    return render_template_string(HISTORY_TEMPLATE, user=user, rows=parsed)
+
+@app.route('/model')
+def model_details():
+    max_imp = max(feat_imp.values()) if feat_imp else 1
+    importances = [(k, round((v / max_imp) * 100, 1)) for k, v in sorted(feat_imp.items(), key=lambda x: x[1], reverse=True)]
+    return render_template_string(MODEL_TEMPLATE, metrics=MODEL_METRICS, importances=importances, user=current_user())
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -475,9 +661,15 @@ def predict():
             val = float(data[key])
             is_weak = val > info['v'] if key == 'Backlogs' else val < info['v']
             if is_weak:
-                improvements.append({'tip': info['tip']})
+                improvements.append({'tip': personalized_tip(key, data[key], data)})
                 weak_keys.append(key)
         message = "Congratulations! You have high chances of getting placed." if status == 'Placed' else "You have areas to improve — check suggestions below."
+        if session.get('user_id'):
+            with db() as conn:
+                conn.execute(
+                    'INSERT INTO predictions (user_id, created_at, status, probability, data, weak_keys) VALUES (?, ?, ?, ?, ?, ?)',
+                    (session['user_id'], datetime.now().strftime('%Y-%m-%d %H:%M'), status, probability, json.dumps(data), json.dumps(weak_keys))
+                )
         return jsonify({'status':status,'message':message,'probability':probability,'feature_importances':feat_imp,'improvements':improvements,'weak_keys':weak_keys})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
@@ -488,7 +680,7 @@ def resources():
     selected = [{'title':p,'msg':RESOURCE_LINKS[p]['msg'],'link':RESOURCE_LINKS[p]['link']} for p in points if p in RESOURCE_LINKS]
     if not selected:
         selected = [{'title':p,'msg':v['msg'],'link':v['link']} for p,v in RESOURCE_LINKS.items()]
-    return render_template_string(RESOURCES_TEMPLATE, resources=selected)
+    return render_template_string(RESOURCES_TEMPLATE, resources=selected, user=current_user())
 
 @app.route('/upload/', methods=['POST'])
 def upload_resume():
@@ -590,10 +782,13 @@ def upload_resume():
         return jsonify({
             "skills": found_skills if found_skills else ["No specific skills detected"],
             "message": "Resume analyzed successfully",
+            "profile": _extract_profile(text, lines),
             "extracted_data": extracted
         })
     except Exception as e:
         return jsonify({'error': f'Failed to parse resume: {str(e)}'}), 400
+
+init_db()
 
 if __name__ == '__main__':
     app.run(debug=True)

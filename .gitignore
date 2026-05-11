@@ -8,5 +8,4 @@ venv/
 ENV/
 .vscode/
 .idea/
-importance.png
-test_model.py
+placement_app.db
