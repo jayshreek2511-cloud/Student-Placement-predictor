@@ -2,8 +2,6 @@
 
 A premium, AI-powered SaaS dashboard that predicts student placement probability using Machine Learning. This application features a modern Glassmorphism UI, real-time probability visualization, and personalized career roadmaps.
 
-![Dashboard Preview](https://via.placeholder.com/800x450/020617/6366F1?text=PlaceAI+Dashboard+Preview)
-
 ## 🚀 Features
 
 - **Smart Resume Analysis**: Upload your PDF resume to automatically populate the form. Uses intelligent text extraction to identify skills, CGPA, internships, and projects.
